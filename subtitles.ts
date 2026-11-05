@@ -44,6 +44,34 @@ function fmtMs(ms: number): string {
 }
 
 // Parses VTT and SRT (same block shape; SRT timestamps use a comma).
+// Cue text is cleaned: HTML tags stripped (SRT <font> wrappers are
+// not valid VTT and render literally), entities decoded, and
+// double-encoded UTF-8 repaired (some OpenSubtitles files store
+// Arabic as mojibake: UTF-8 bytes re-encoded as Latin-1 — the
+// repair maps each char back to its byte and UTF-8-decodes; it
+// only applies when the result actually contains Arabic).
+function fixDoubleEncoded(s: string): string {
+  if (/[\u0600-\u06FF]/.test(s)) return s;
+  try {
+    const bytes = Uint8Array.from(s, (c) => c.charCodeAt(0) & 0xff);
+    const fixed = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return /[\u0600-\u06FF]/.test(fixed) ? fixed : s;
+  } catch {
+    return s;
+  }
+}
+
+function cleanCueText(t: string): string {
+  return fixDoubleEncoded(
+    t.replace(/<[^>]+>/g, "")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;|&apos;/g, "'"),
+  ).trim();
+}
+
 function parseSubs(text: string): Cue[] {
   const norm = text.replace(/\r\n?/g, "\n");
   const blocks = norm.split(/\n\s*\n/);
@@ -65,7 +93,7 @@ function parseSubs(text: string): Cue[] {
       end: fmtMs(tsToMs(m[2])),
       startMs: tsToMs(m[1]),
       endMs: tsToMs(m[2]),
-      text: body,
+      text: cleanCueText(body),
     });
   }
   return cues;
@@ -186,4 +214,75 @@ export async function handleSubMerge(url: URL): Promise<Response> {
   } catch (e) {
     return new Response(`merge failed: ${String(e).slice(0, 120)}`, { status: 502 });
   }
+}
+
+// ---------- hosting: POST a VTT, get a short https URL ----------
+// Why: the phone (not the server) is the only place that can fetch
+// the site's own subtitle files (Cloudflare-walled from datacenter
+// IPs), and the player only lists https URLs — data: URIs are
+// dropped from the track list. So the addon merges/translates
+// on-device, POSTs the finished VTT here, and emits the returned
+// URL as a normal subtitle entry. Storage is Deno KV with a 24h
+// TTL; values are chunked (KV limit is 64 KiB per value).
+const STORE_TTL_MS = 24 * 60 * 60 * 1000;
+const STORE_CHUNK = 30000;
+
+function storeId(): string {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
+
+export async function handleSubStore(req: Request, base: URL): Promise<Response> {
+  if (req.method !== "POST") {
+    return new Response("POST vtt text (raw, JSON {vtt}, or form vtt=)", { status: 405 });
+  }
+  const raw = await req.text();
+  let text = raw;
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("{")) {
+    try {
+      text = JSON.parse(trimmed).vtt ?? "";
+    } catch {
+      text = "";
+    }
+  } else if (trimmed.startsWith("vtt=")) {
+    text = new URLSearchParams(trimmed).get("vtt") ?? "";
+  }
+  if (!text || text.length > 500000) {
+    return new Response("bad vtt", { status: 400 });
+  }
+  const id = storeId();
+  const kv = await Deno.openKv();
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += STORE_CHUNK) chunks.push(text.slice(i, i + STORE_CHUNK));
+  await kv.set(["sub", id, "meta"], { n: chunks.length }, { expireIn: STORE_TTL_MS });
+  for (let i = 0; i < chunks.length; i++) {
+    await kv.set(["sub", id, i], chunks[i], { expireIn: STORE_TTL_MS });
+  }
+  kv.close();
+  return new Response(JSON.stringify({ ok: true, url: `${base.origin}/s/${id}` }), {
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+  });
+}
+
+export async function handleSubGet(id: string): Promise<Response> {
+  if (!id || /[^a-z0-9]/i.test(id)) return new Response("not found", { status: 404 });
+  const kv = await Deno.openKv();
+  const meta = await kv.get<{ n: number }>(["sub", id, "meta"]);
+  if (!meta.value) {
+    kv.close();
+    return new Response("not found", { status: 404 });
+  }
+  let out = "";
+  for (let i = 0; i < meta.value.n; i++) {
+    const part = await kv.get<string>(["sub", id, i]);
+    if (part.value) out += part.value;
+  }
+  kv.close();
+  return new Response(out, {
+    headers: {
+      "Content-Type": "text/vtt; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=3600",
+    },
+  });
 }
