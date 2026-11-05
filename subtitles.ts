@@ -187,9 +187,14 @@ async function translateVTT(vttUrl: string, to: string): Promise<string> {
 
 // Dual display: Arabic line + English line in one cue, timed by the
 // English cue; Arabic-only cues (no English overlap) are appended.
-function mergeVTT(engText: string, araText: string): string {
+// v12: the Arabic file is shifted by shiftMs before merging — the
+// best (file, shift) is chosen by the caller from timing coverage,
+// because the first Arabic file on OpenSubtitles is often the
+// wrong-timed one (Naruto S1E1: first file 74% coverage, starts at
+// 108s; second file 95%, starts at 4s).
+function mergeVTT(engText: string, araText: string, shiftMs = 0): string {
   const eng = parseSubs(engText);
-  const ara = parseSubs(araText);
+  const ara = parseSubs(araText).map((c) => ({ ...c, startMs: c.startMs + shiftMs, endMs: c.endMs + shiftMs }));
   const used = new Set<number>();
   const merged: Cue[] = [];
   for (const e of eng) {
@@ -234,20 +239,44 @@ export async function handleSubTranslate(url: URL): Promise<Response> {
 
 export async function handleSubMerge(url: URL): Promise<Response> {
   const eng = url.searchParams.get("eng") || "";
-  const ara = url.searchParams.get("ara") || "";
-  if (!eng || !ara) return new Response("missing eng/ara params", { status: 400 });
+  // v12: accept several Arabic candidates; score each against the
+  // English file by cue-overlap coverage (shifts -2s..+2s) and merge
+  // the best-aligned one. A single ara param behaves as before.
+  const aras = url.searchParams.getAll("ara").filter((a) => a.length > 0);
+  if (!eng || aras.length === 0) return new Response("missing eng/ara params", { status: 400 });
   try {
-    const [engText, araText] = await Promise.all([
-      fetch(eng, { headers: { "User-Agent": "Mozilla/5.0" } }).then((r) => {
-        if (!r.ok) throw new Error(`eng: ${r.status}`);
-        return r.text();
-      }),
-      fetch(ara, { headers: { "User-Agent": "Mozilla/5.0" } }).then((r) => {
-        if (!r.ok) throw new Error(`ara: ${r.status}`);
-        return r.text();
-      }),
-    ]);
-    return vttResponse(mergeVTT(engText, araText));
+    const engText = await fetch(eng, { headers: { "User-Agent": "Mozilla/5.0" } }).then((r) => {
+      if (!r.ok) throw new Error(`eng: ${r.status}`);
+      return r.text();
+    });
+    const engCues = parseSubs(engText);
+    const fetched: { text: string; idx: number }[] = [];
+    for (let i = 0; i < aras.length; i++) {
+      try {
+        const t = await fetch(aras[i], { headers: { "User-Agent": "Mozilla/5.0" } }).then((r) => {
+          if (!r.ok) throw new Error(`ara: ${r.status}`);
+          return r.text();
+        });
+        fetched.push({ text: t, idx: i });
+      } catch { /* skip un-fetchable candidates */ }
+    }
+    if (fetched.length === 0) return new Response("merge failed: ara: all failed", { status: 502 });
+    let best = { text: fetched[0].text, idx: fetched[0].idx, shift: 0, cov: -1 };
+    for (const f of fetched) {
+      const araCues = parseSubs(f.text);
+      for (let shift = -2000; shift <= 2000; shift += 500) {
+        let cov = 0;
+        for (const e of engCues) {
+          for (const a of araCues) {
+            if (a.startMs + shift < e.endMs && a.endMs + shift > e.startMs) { cov++; break; }
+          }
+        }
+        if (cov > best.cov) best = { text: f.text, idx: f.idx, shift, cov };
+      }
+    }
+    const resp = vttResponse(mergeVTT(engText, best.text, best.shift));
+    resp.headers.set("X-Merge-Ara", `idx=${best.idx} shift=${best.shift} cov=${best.cov}/${engCues.length}`);
+    return resp;
   } catch (e) {
     return new Response(`merge failed: ${String(e).slice(0, 120)}`, { status: 502 });
   }
