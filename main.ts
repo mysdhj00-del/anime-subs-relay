@@ -19,7 +19,7 @@
 
 import { Impit } from "npm:impit";
 import * as cheerio from "npm:cheerio";
-import { handleSubTranslate, handleSubMerge } from "./subtitles.ts";
+import { handleSubTranslate, handleSubMerge, handleSubStore, handleSubGet } from "./subtitles.ts";
 
 // ------------------------------------------------------------ impfetch
 let impitClient: Impit | null = null;
@@ -349,7 +349,7 @@ Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
 
   if (url.pathname === "/") {
-    return new Response("deno-relay: /relay/egydead /relay/page /relay/translate /relay/mergesubs /probe", {
+    return new Response("deno-relay: /relay/egydead /relay/page /relay/translate /relay/mergesubs /relay/store /s/<id> /probe", {
       status: 200,
     });
   }
@@ -367,6 +367,18 @@ Deno.serve(async (req: Request) => {
 
   if (url.pathname === "/relay/mergesubs") {
     return handleSubMerge(url);
+  }
+
+  // AnimeVerse subtitle hosting (v5): the addon merges/translates
+  // on-device (only the phone can fetch the site's own subs) and
+  // POSTs the finished VTT here; the returned short URL is a normal
+  // https subtitle entry the player lists.
+  if (url.pathname === "/relay/store") {
+    return handleSubStore(req, url);
+  }
+
+  if (url.pathname.startsWith("/s/")) {
+    return handleSubGet(url.pathname.slice(3));
   }
 
   if (url.pathname === "/relay/egydead") {
