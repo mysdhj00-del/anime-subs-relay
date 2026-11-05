@@ -50,10 +50,30 @@ function fmtMs(ms: number): string {
 // Arabic as mojibake: UTF-8 bytes re-encoded as Latin-1 — the
 // repair maps each char back to its byte and UTF-8-decodes; it
 // only applies when the result actually contains Arabic).
+// Windows-1252 byte values for the punctuation chars that Latin-1
+// lacks (the mojibake in OpenSubtitles files uses Win1252: byte
+// 0x84 arrives as „ U+201E, 0x93 as “ U+201C, ...). A plain
+// Latin-1 remap produces wrong bytes for those and the repair
+// silently fails — this table is what makes the repair work.
+const WIN1252_SPECIAL: Record<string, number> = {
+  "€": 0x80, "‚": 0x82, "ƒ": 0x83, "„": 0x84, "…": 0x85, "†": 0x86, "‡": 0x87,
+  "ˆ": 0x88, "‰": 0x89, "Š": 0x8a, "‹": 0x8b, "Œ": 0x8c, "Ž": 0x8e,
+  "‘": 0x91, "’": 0x92, "“": 0x93, "”": 0x94, "•": 0x95, "–": 0x96, "—": 0x97,
+  "˜": 0x98, "™": 0x99, "š": 0x9a, "›": 0x9b, "œ": 0x9c, "ž": 0x9e, "Ÿ": 0x9f,
+};
+
 function fixDoubleEncoded(s: string): string {
   if (/[\u0600-\u06FF]/.test(s)) return s;
   try {
-    const bytes = Uint8Array.from(s, (c) => c.charCodeAt(0) & 0xff);
+    const bytes = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      const code = c.charCodeAt(0);
+      if (code < 0x80) bytes[i] = code;
+      else if (code >= 0xa0 && code <= 0xff) bytes[i] = code;
+      else if (c in WIN1252_SPECIAL) bytes[i] = WIN1252_SPECIAL[c];
+      else return s; // unmappable char — leave the cue as-is
+    }
     const fixed = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     return /[\u0600-\u06FF]/.test(fixed) ? fixed : s;
   } catch {
@@ -259,22 +279,25 @@ export async function handleSubStore(req: Request, base: URL): Promise<Response>
     await kv.set(["sub", id, i], chunks[i], { expireIn: STORE_TTL_MS });
   }
   kv.close();
-  return new Response(JSON.stringify({ ok: true, url: `${base.origin}/s/${id}` }), {
+  return new Response(JSON.stringify({ ok: true, url: `${base.origin}/s/${id}.vtt` }), {
     headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
   });
 }
 
 export async function handleSubGet(id: string): Promise<Response> {
-  if (!id || /[^a-z0-9]/i.test(id)) return new Response("not found", { status: 404 });
+  // Stored URLs end with .vtt so players can detect the format
+  // from the extension; strip it before the KV lookup.
+  const cleanId = id.replace(/\.vtt$/i, "");
+  if (!cleanId || /[^a-z0-9]/i.test(cleanId)) return new Response("not found", { status: 404 });
   const kv = await Deno.openKv();
-  const meta = await kv.get<{ n: number }>(["sub", id, "meta"]);
+  const meta = await kv.get<{ n: number }>(["sub", cleanId, "meta"]);
   if (!meta.value) {
     kv.close();
     return new Response("not found", { status: 404 });
   }
   let out = "";
   for (let i = 0; i < meta.value.n; i++) {
-    const part = await kv.get<string>(["sub", id, i]);
+    const part = await kv.get<string>(["sub", cleanId, i]);
     if (part.value) out += part.value;
   }
   kv.close();
