@@ -63,22 +63,39 @@ const WIN1252_SPECIAL: Record<string, number> = {
 };
 
 function fixDoubleEncoded(s: string): string {
-  if (/[\u0600-\u06FF]/.test(s)) return s;
-  try {
-    const bytes = new Uint8Array(s.length);
-    for (let i = 0; i < s.length; i++) {
-      const c = s[i];
-      const code = c.charCodeAt(0);
-      if (code < 0x80) bytes[i] = code;
-      else if (code >= 0xa0 && code <= 0xff) bytes[i] = code;
-      else if (c in WIN1252_SPECIAL) bytes[i] = WIN1252_SPECIAL[c];
-      else return s; // unmappable char — leave the cue as-is
+  // Per-run repair: remap each run of Latin-1/Win1252 chars back to
+  // bytes and UTF-8-decode it, keeping genuine Arabic/CJK runs
+  // untouched. Runs are needed because one cue mixes proper Arabic
+  // with mojibake, and the 0x80-0x9F range must map to its own byte
+  // (Latin-1 control chars like U+0081, which is UTF-8 byte 0x81
+  // of an Arabic letter) — a whole-string remap bails on those.
+  let out = "";
+  let run = "";
+  const flush = () => {
+    if (!run) return;
+    try {
+      const bytes = new Uint8Array(run.length);
+      for (let i = 0; i < run.length; i++) {
+        const c = run[i];
+        const code = c.charCodeAt(0);
+        if (code < 0x100) bytes[i] = code;
+        else if (c in WIN1252_SPECIAL) bytes[i] = WIN1252_SPECIAL[c];
+        else { out += run; run = ""; return; }
+      }
+      const fixed = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      out += /[\u0600-\u06FF]/.test(fixed) ? fixed : run;
+    } catch {
+      out += run;
     }
-    const fixed = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    return /[\u0600-\u06FF]/.test(fixed) ? fixed : s;
-  } catch {
-    return s;
+    run = "";
+  };
+  for (const c of s) {
+    const code = c.charCodeAt(0);
+    if (code < 0x100 || c in WIN1252_SPECIAL) run += c;
+    else { flush(); out += c; }
   }
+  flush();
+  return out;
 }
 
 function cleanCueText(t: string): string {
